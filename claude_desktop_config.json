@@ -1,0 +1,10 @@
+ 
+{
+  "mcpServers": {
+    "lead-automation": {
+      "command": "python",
+      "args": ["C:\\Users\\gokul\\lead_ai_system\\mcp_server.py"],
+      "env": {}
+    }
+  }
+}
