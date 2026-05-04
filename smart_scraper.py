@@ -1,43 +1,42 @@
 import asyncio
-from browser_use import Agent
 from langchain_ollama import ChatOllama
+from browser_use import Agent
 
-# Create a custom class that inherits from ChatOllama
-# This natively satisfies browser-use without triggering Pydantic errors
-class BrowserOllama(ChatOllama):
-    @property
-    def provider(self) -> str:
-        return "ollama"
+# A lightweight wrapper to satisfy browser-use's telemetry checks
+class BrowserLLMWrapper:
+    def __init__(self, llm):
+        self.llm = llm
+        self.provider = 'ollama'  # Satisfies line 235 in service.py
+        self.model_name = getattr(llm, 'model', 'qwen3:8b')
+
+    async def ainvoke(self, *args, **kwargs):
+        return await self.llm.ainvoke(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.llm, name)
 
 async def run_local_scraper():
-    print("🔌 Connecting to local Ollama (qwen3:8b)...")
-    
-    # Use our safe, custom class
-    llm = BrowserOllama(
-        model="qwen3:8b", 
-        temperature=0.0,
+    raw_llm = ChatOllama(
+        model="qwen3:8b",
+        temperature=0, 
+        base_url="http://127.0.0.1:11434",
+        format="json",  # CRITICAL: Forces Ollama to strictly output JSON
+        num_ctx=8192
     )
 
-    task_prompt = """
-    Go to duckduckgo.com.
-    Search for 'dental clinics in Thrissur Kerala'.
-    Look at the search results. 
-    Extract the names and phone numbers of the clinics.
-    Format your final output as a clear list.
-    """
+    # Wrap the standard LLM
+    llm = BrowserLLMWrapper(raw_llm)
 
-    # We disable telemetry and gif generation to reduce library overhead
+    task_prompt = "Go to google.com, type 'AI news' in the search box, and press enter."
+
     agent = Agent(
         task=task_prompt,
         llm=llm,
-        generate_gif=False, 
+        use_vision=False, # Essential for local 8B models
+        generate_gif=False,
     )
-    
-    print("🤖 Local Agent is taking over the browser. Watch it work...")
-    result = await agent.run()
-    
-    print("\n✅ Final Result from AI:")
-    print(result.final_result())
 
-if __name__ == "__main__":
+    await agent.run()
+
+if __name__ == '__main__':
     asyncio.run(run_local_scraper())
