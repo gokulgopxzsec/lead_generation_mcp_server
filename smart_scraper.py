@@ -2,388 +2,517 @@ import asyncio
 import json
 import re
 import httpx
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 from urllib.parse import quote_plus
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-OLLAMA_URL   = "http://127.0.0.1:11434/api/generate"
-MODEL        = "qwen3:8b"
-SEARCH_QUERY = "AI startups in India"
-MAX_STEPS    = 20
-MAX_RETRIES  = 3
+OLLAMA_URL  = "http://127.0.0.1:11434/api/generate"
+MODEL       = "qwen3:8b"
+TARGET      = 20
 # ────────────────────────────────────────────────────────────────────────────
 
-TASK = """Extract company names and their OFFICIAL websites for AI startups in India.
-Rules for websites:
-- Find REAL company URLs (e.g. uniphore.com, qure.ai) — NOT internal directory links like ai-startups.pro/video/...
-- If a page only shows directory links, navigate into the company page to find the real URL.
-Collect at least 15 unique companies with real websites."""
+# ── SEARCH: Bing instead of DuckDuckGo (Bing renders results without JS challenges)
+BING_BASE = "https://www.bing.com/search?q={q}&count=10"
 
-START_URL = f"https://duckduckgo.com/?q={quote_plus(SEARCH_QUERY)}&ia=web"
+SEED_SEARCHES = [
+    "site:instamojo.com/store ebook India buy",
+    "site:gumroad.com India digital download course",
+    "site:topmate.io India creator consultation",
+    "site:graphy.com Indian online course creator",
+    "site:teachable.com India course buy",
+    "site:pages.razorpay.com digital course India",
+    "India small business sell ebook template \"buy now\"",
+    "India digital creator sell course \"link in bio\"",
+    "site:payhip.com India digital product sell",
+    "Indian freelancer sell design template gumroad OR payhip OR instamojo",
+]
+
+# Direct marketplace listing pages — SPA-aware with fallback selectors
+SEED_URLS = [
+    "https://www.instamojo.com/marketplace/",
+    "https://topmate.io/explore/category/all",
+    "https://payhip.com/discover",                  # static — easy to scrape
+    "https://gumroad.com/discover",
+    "https://pages.razorpay.com/stores/",
+    "https://www.graphy.com/explore",
+]
+
+# ── REGEX ────────────────────────────────────────────────────────────────────
+EMAIL_RE  = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+PHONE_RE  = re.compile(r"(?:\+91[\s\-]?|(?<!\d)0)?[6-9]\d{9}(?!\d)")
+WA_RE     = re.compile(r"(?:wa\.me|api\.whatsapp\.com/send\?phone=)[/\?]?(\d+)", re.I)
+INSTA_RE  = re.compile(r"(?:instagram\.com|instagr\.am)/([A-Za-z0-9_.]{2,30})/?", re.I)
+
+# Regex to find seller profile URLs directly in page HTML (fallback when LLM fails)
+SELLER_URL_PATTERNS = [
+    re.compile(r"https?://[a-zA-Z0-9\-]+\.gumroad\.com(?:/[^\s\"'<>]*)?"),
+    re.compile(r"https?://(?:www\.)?instamojo\.com/[a-zA-Z0-9_\-]{3,}/(?!marketplace|blog|pricing|features|login|signup)"),
+    re.compile(r"https?://[a-zA-Z0-9\-]+\.graphy\.com(?:/[^\s\"'<>]*)?"),
+    re.compile(r"https?://[a-zA-Z0-9\-]+\.teachable\.com(?:/[^\s\"'<>]*)?"),
+    re.compile(r"https?://topmate\.io/([a-zA-Z0-9_\-]{3,})(?:/[^\s\"'<>]*)?"),
+    re.compile(r"https?://payhip\.com/([a-zA-Z0-9_\-]{3,})"),
+    re.compile(r"https?://pages\.razorpay\.com/[a-zA-Z0-9_\-]{3,}"),
+]
+
+JUNK_EMAIL = [".png",".jpg",".gif",".svg",".js",".css","example","sentry",
+              "noreply","no-reply","domain.com","youremail","email@","user@"]
+JUNK_DOMAINS = [
+    "bing.com","google.com","linkedin.com","facebook.com","twitter.com",
+    "crunchbase.com","tracxn.com","wikipedia.org","yourstory.com","techcrunch.com",
+    "inc42.com","entrackr.com","medium.com","instagram.com","youtube.com",
+    "t.me","x.com","apple.com","microsoft.com","amazon.com",
+]
+INSTA_SKIP = {"p","reel","reels","explore","accounts","stories","tv","ar",
+              "shoppingbag","legal","about","help","hashtag","direct"}
+CONTACT_PATHS = ["/contact","/contact-us","/about","/about-us","/team","/support","/reach-us"]
+
+# Domains that are marketplace homes — skip them as seller URLs
+MARKETPLACE_HOME = {
+    "gumroad.com","instamojo.com","graphy.com","teachable.com",
+    "topmate.io","payhip.com","pages.razorpay.com",
+}
 
 
-# ── LLM ─────────────────────────────────────────────────────────────────────
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
-async def ask_llm(messages: list[dict]) -> str:
-    prompt = "\n".join(
-        f"{m['role'].upper()}: {m['content']}" for m in messages
-    ) + "\nASSISTANT:"
+def is_real_seller_url(url: str) -> bool:
+    """True if URL looks like an individual seller page (not a marketplace home)."""
+    if not url or not url.startswith("http"):
+        return False
+    # Strip to host
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lstrip("www.")
+        # Must NOT be a plain marketplace home
+        if host in MARKETPLACE_HOME:
+            return False
+        # Subdomain seller URLs (e.g. xyz.gumroad.com)
+        for mkt in MARKETPLACE_HOME:
+            if host.endswith("." + mkt) and host != mkt:
+                return True
+        # Path-based seller URLs (e.g. instamojo.com/xyz/, topmate.io/xyz)
+        path = urlparse(url).path.strip("/")
+        parts = [p for p in path.split("/") if p]
+        if parts and len(parts[0]) >= 3:
+            return True
+    except Exception:
+        pass
+    return False
 
+
+def is_junk_domain(url: str) -> bool:
+    return any(d in url for d in JUNK_DOMAINS)
+
+
+def clean_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    if len(digits) == 10 and digits[0] in "6789":
+        return "+91" + digits
+    return ""
+
+
+# ── SAFE NAV ─────────────────────────────────────────────────────────────────
+
+async def safe_goto(page, url: str, timeout=25000, settle=2.0) -> bool:
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+        await asyncio.sleep(settle)
+        return True
+    except PWTimeout:
+        print(f"  [timeout] {url[:80]}")
+        return False
+    except Exception:
+        print(f"  [nav error] {url[:80]}")
+        return False
+
+
+async def wait_for_content(page, timeout=12000) -> None:
+    """
+    For SPAs: wait until body has meaningful text.
+    Falls back gracefully if nothing loads.
+    """
+    try:
+        # Wait for any of these common content markers
+        await page.wait_for_function(
+            "() => document.body.innerText.trim().length > 200",
+            timeout=timeout
+        )
+    except PWTimeout:
+        pass  # Use whatever rendered
+
+
+# ── PAGE READER ───────────────────────────────────────────────────────────────
+
+async def get_page_text(page, chars=5000) -> str:
+    await wait_for_content(page)
+    try:
+        return await page.evaluate(f"() => document.body.innerText.slice(0, {chars})")
+    except Exception:
+        return ""
+
+
+async def get_page_html(page) -> str:
+    try:
+        return await page.evaluate("() => document.documentElement.innerHTML.slice(0, 80000)")
+    except Exception:
+        return ""
+
+
+async def get_page_links(page) -> list[dict]:
+    try:
+        return await page.evaluate("""() => {
+            const links = [];
+            document.querySelectorAll('a[href]').forEach(el => {
+                const href = el.href || '';
+                const text = (el.innerText || el.title || '').trim().slice(0, 100);
+                if (href.startsWith('http') && text && href.length < 300) {
+                    links.push({text, href});
+                }
+            });
+            return links.slice(0, 150);
+        }""")
+    except Exception:
+        return []
+
+
+# ── REGEX FALLBACK SELLER EXTRACTOR ──────────────────────────────────────────
+
+def regex_extract_seller_urls(html: str) -> list[str]:
+    """
+    Scan raw HTML for known marketplace seller URLs.
+    This is the fallback when the LLM returns nothing.
+    """
+    found = set()
+    for pattern in SELLER_URL_PATTERNS:
+        for m in pattern.findall(html):
+            url = m if m.startswith("http") else f"https://topmate.io/{m}"
+            if is_real_seller_url(url):
+                # Normalize: strip query string and fragment
+                url = url.split("?")[0].split("#")[0].rstrip("/")
+                found.add(url)
+    return list(found)
+
+
+def guess_name_from_url(url: str) -> str:
+    """Extract a readable name from a seller URL."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    host = parsed.netloc
+    path = parsed.path.strip("/").split("/")[0] if parsed.path.strip("/") else ""
+
+    # Subdomain seller: xyz.gumroad.com → "Xyz"
+    for mkt in MARKETPLACE_HOME:
+        sub = host.replace("." + mkt, "").replace("www.", "")
+        if sub and sub != host:
+            return sub.replace("-", " ").replace("_", " ").title()
+
+    # Path seller: topmate.io/rahul_sharma → "Rahul Sharma"
+    if path:
+        return path.replace("-", " ").replace("_", " ").title()
+
+    return host
+
+
+def guess_category_from_url(url: str) -> str:
+    if "gumroad" in url:       return "digital downloads"
+    if "instamojo" in url:     return "digital products"
+    if "graphy" in url:        return "online courses"
+    if "teachable" in url:     return "online courses"
+    if "topmate" in url:       return "creator services"
+    if "payhip" in url:        return "digital products"
+    if "razorpay" in url:      return "digital products"
+    return "digital products"
+
+
+# ── LLM ──────────────────────────────────────────────────────────────────────
+
+async def ask_llm(prompt: str) -> str:
     payload = {
         "model": MODEL,
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {
-            "temperature": 0,
-            "num_ctx": 16000,
-            "num_predict": 600,
-        },
+        "options": {"temperature": 0, "num_ctx": 12000, "num_predict": 800},
     }
-
     async with httpx.AsyncClient(timeout=120) as client:
         r = await client.post(OLLAMA_URL, json=payload)
         r.raise_for_status()
         return r.json()["response"]
 
 
-# ── PARSERS ──────────────────────────────────────────────────────────────────
-
-def parse_action(raw: str) -> dict:
-    """Extract and validate action JSON from LLM response."""
-    cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
-    data = {}
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            try:
-                data = json.loads(match.group())
-            except Exception:
-                pass
-
-    # Ensure all fields exist and are strings
-    for field in ["action", "selector", "text", "url", "data", "reason"]:
-        if field not in data:
-            data[field] = ""
-        elif not isinstance(data[field], str):
-            data[field] = str(data[field])
-
-    # Sanitize action
-    valid_actions = {"click", "type", "navigate", "scroll", "extract", "done"}
-    if data.get("action") not in valid_actions:
-        data["action"] = "scroll"
-
-    return data
-
-
-def parse_extracted_data(raw_data: str) -> list[dict]:
-    """
-    Parse LLM extracted data into list of {name, website} dicts.
-    Handles: JSON arrays, JSON dicts, single-quote JSON, plain text lines.
-    """
-    raw_data = raw_data.strip()
-    if not raw_data:
+async def llm_extract_sellers(page_text: str, links: list[dict], source_url: str) -> list[dict]:
+    """Ask LLM to identify real SME digital seller profiles."""
+    if not page_text.strip():
         return []
 
-    # Fix common LLM habit of using single quotes instead of double
-    def fix_quotes(s):
-        return s.replace("'", '"')
-
-    # Try JSON parse
-    for attempt in [raw_data, fix_quotes(raw_data)]:
-        try:
-            parsed = json.loads(attempt)
-            if isinstance(parsed, list):
-                results = []
-                for item in parsed:
-                    if isinstance(item, dict):
-                        name    = str(item.get("name", "")).strip()
-                        website = str(item.get("website", item.get("url", ""))).strip()
-                        if name:
-                            results.append({"name": name, "website": website})
-                return results
-            if isinstance(parsed, dict) and parsed.get("name"):
-                return [{"name": str(parsed["name"]).strip(),
-                         "website": str(parsed.get("website", parsed.get("url", ""))).strip()}]
-        except Exception:
-            pass
-
-    # Fallback: plain text lines  "Company - https://..."  or  "Company: https://..."
-    results = []
-    for line in raw_data.splitlines():
-        line = line.strip().lstrip("0123456789.-) ")
-        if not line:
-            continue
-        for sep in [" - ", ": ", " | "]:
-            if sep in line:
-                parts = line.split(sep, 1)
-                results.append({"name": parts[0].strip(), "website": parts[1].strip()})
-                break
-        else:
-            results.append({"name": line, "website": ""})
-    return results
-
-
-def is_real_website(url: str) -> bool:
-    """Return False for internal directory links, True for real company URLs."""
-    if not url or not url.startswith("http"):
-        return False
-    junk_domains = [
-        "ai-startups.pro", "crunchbase.com", "linkedin.com",
-        "tracxn.com", "yourstory.com", "techcrunch.com",
-        "duckduckgo.com", "ycombinator.com",
-    ]
-    return not any(d in url for d in junk_domains)
-
-
-# ── HELPERS ──────────────────────────────────────────────────────────────────
-
-def detect_loop(history: list[dict]) -> bool:
-    if len(history) < MAX_RETRIES:
-        return False
-    last = history[-MAX_RETRIES:]
-    return all(
-        a.get("action") == last[0].get("action") and
-        a.get("selector") == last[0].get("selector") and
-        a.get("url") == last[0].get("url")
-        for a in last
+    links_str = "\n".join(
+        f"  {l['href']}  |  {l['text']}"
+        for l in links[:60]
+        if not is_junk_domain(l["href"])
     )
 
+    prompt = f"""You are a B2B lead extractor. Analyse the page content from {source_url}.
 
-async def get_page_summary(page) -> str:
-    for attempt in range(3):
+Find INDIAN SMALL BUSINESSES or CREATORS who SELL digital products
+(online courses, ebooks, templates, coaching, design assets, software tools).
+
+Rules:
+- Only include REAL seller/creator profile or store pages — not news articles, not how-to guides, not marketplace homepages.
+- The "website" must be the seller's OWN URL (e.g. https://johndoe.graphy.com or https://instamojo.com/abc/).
+- Ignore links to homepages: instamojo.com, graphy.com, gumroad.com (without subpath), google.com etc.
+- Return ONLY a JSON array. If you find 0 sellers, return [].
+
+PAGE TEXT:
+{page_text[:3000]}
+
+LINKS ON PAGE:
+{links_str}
+
+Return JSON array:
+[
+  {{"name": "Seller Name", "website": "https://...", "category": "product type"}}
+]
+
+ONLY JSON. No explanation."""
+
+    raw = await ask_llm(prompt)
+    raw = re.sub(r"```(?:json)?|```", "", raw).strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            results = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name    = str(item.get("name", "")).strip()
+                website = str(item.get("website", "")).strip()
+                cat     = str(item.get("category", "")).strip()
+                if name and website.startswith("http") and is_real_seller_url(website):
+                    results.append({"name": name, "website": website, "category": cat})
+            return results
+    except Exception:
+        pass
+    return []
+
+
+# ── SELLER DISCOVERY ─────────────────────────────────────────────────────────
+
+def merge_seller(seen: dict, name: str, website: str, category: str) -> bool:
+    """Add seller to seen dict. Returns True if new."""
+    # Deduplicate by website domain/path
+    website = website.rstrip("/")
+    for existing in seen.values():
+        if existing["website"].rstrip("/") == website:
+            return False
+    if name not in seen:
+        seen[name] = {
+            "website": website, "category": category,
+            "email": "", "phone": "", "whatsapp": "", "instagram": "",
+        }
+        return True
+    return False
+
+
+async def discover_from_page(page, seen: dict, source_url: str) -> int:
+    """
+    Scroll, extract text+links, try LLM then regex fallback.
+    Returns count of new sellers added.
+    """
+    for _ in range(4):
+        await page.mouse.wheel(0, 1200)
+        await asyncio.sleep(1.0)
+
+    text  = await get_page_text(page)
+    html  = await get_page_html(page)
+    links = await get_page_links(page)
+
+    added = 0
+
+    # — LLM path
+    sellers = await llm_extract_sellers(text, links, source_url)
+    for s in sellers:
+        if merge_seller(seen, s["name"], s["website"], s["category"]):
+            added += 1
+
+    # — Regex fallback (runs always; LLM may have missed some)
+    for url in regex_extract_seller_urls(html):
+        name = guess_name_from_url(url)
+        cat  = guess_category_from_url(url)
+        if merge_seller(seen, name, url, cat):
+            added += 1
+
+    return added
+
+
+# ── CONTACT SCRAPER ───────────────────────────────────────────────────────────
+
+async def scrape_contacts(page, name: str, website: str) -> dict:
+    result = {"email": "", "phone": "", "whatsapp": "", "instagram": ""}
+    if not website.startswith("http") or is_junk_domain(website):
+        return result
+
+    base = website.rstrip("/")
+    urls_to_try = [base] + [base + p for p in CONTACT_PATHS]
+
+    for url in urls_to_try:
+        ok = await safe_goto(page, url, timeout=15000, settle=1.0)
+        if not ok:
+            continue
         try:
-            await page.wait_for_load_state("domcontentloaded")
-            return await page.evaluate("""() => {
-                const bodyText = document.body.innerText.slice(0, 3000);
-                const elements = [];
-                const selectors = ['a[href]', 'button', 'input', '[role=button]'];
-                selectors.forEach(sel => {
-                    document.querySelectorAll(sel).forEach(el => {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0 && rect.top < 2000) {
-                            const text = (el.innerText || el.getAttribute('aria-label') || el.placeholder || '').trim().slice(0, 80);
-                            if (text) {
-                                elements.push({
-                                    tag: el.tagName.toLowerCase(),
-                                    text,
-                                    href: el.href || '',
-                                    id: el.id || '',
-                                    placeholder: el.placeholder || ''
-                                });
-                            }
-                        }
-                    });
-                });
-                return JSON.stringify({ bodyText, elements: elements.slice(0, 50) });
-            }""")
-        except Exception as e:
-            if attempt == 2:
-                raise
-            print(f"⚠️  Page context unstable (attempt {attempt + 1}), retrying...")
-            await asyncio.sleep(2)
+            await wait_for_content(page, timeout=6000)
+            text = await page.evaluate("() => document.body.innerText")
+            html = await page.evaluate("() => document.documentElement.innerHTML")
+        except Exception:
+            continue
+
+        if not result["email"]:
+            emails = [e for e in EMAIL_RE.findall(text)
+                      if not any(t in e.lower() for t in JUNK_EMAIL)]
+            if emails:
+                for pref in ["contact","info","hello","support","sales","enquir","help"]:
+                    for e in emails:
+                        if pref in e.lower():
+                            result["email"] = e; break
+                    if result["email"]: break
+                if not result["email"]:
+                    result["email"] = emails[0]
+
+        if not result["phone"]:
+            for rp in PHONE_RE.findall(text):
+                cp = clean_phone(rp)
+                if cp:
+                    result["phone"] = cp; break
+
+        if not result["whatsapp"]:
+            wa = WA_RE.findall(html)
+            if wa:
+                num = wa[0]
+                if len(num) == 12 and num.startswith("91"): num = num[2:]
+                result["whatsapp"] = "+91" + num if len(num) == 10 else "+" + num
+            elif result["phone"]:
+                result["whatsapp"] = result["phone"]
+
+        if not result["instagram"]:
+            for handle in INSTA_RE.findall(html):
+                if handle.lower() not in INSTA_SKIP and len(handle) > 2:
+                    result["instagram"] = f"https://instagram.com/{handle}"
+                    break
+
+        if all(result.values()):
+            break
+
+    parts = []
+    if result["email"]:     parts.append(f"email:{result['email']}")
+    if result["phone"]:     parts.append(f"phone:{result['phone']}")
+    if result["whatsapp"]:  parts.append(f"wa:{result['whatsapp']}")
+    if result["instagram"]: parts.append(f"ig:{result['instagram']}")
+    print(f"  {name[:35]:<35} {' | '.join(parts) or 'nothing found'}")
+    return result
 
 
-def print_results(seen: dict[str, str], label: str):
-    print(f"\n{label} {len(seen)} unique companies:\n")
-    print(f"  {'#':<4} {'Company':<35} {'Website'}")
-    print(f"  {'-'*4} {'-'*35} {'-'*40}")
-    for i, (name, website) in enumerate(seen.items(), 1):
-        flag = "✅" if is_real_website(website) else "⚠️ "
-        print(f"  {i:<4} {name:<35} {flag} {website}")
-    real = sum(1 for w in seen.values() if is_real_website(w))
-    print(f"\n  Real websites: {real}/{len(seen)}")
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 
-
-# ── AGENT ────────────────────────────────────────────────────────────────────
-
-async def run_agent():
-    system_prompt = f"""You are a precise web scraping agent. Your ONLY job:
-TASK: {TASK}
-Extract company names, OFFICIAL websites, and contact emails for AI startups in India.
-Rules for websites:
-- Find REAL company URLs (e.g. uniphore.com, qure.ai) — NOT internal directory links like ai-startups.pro/video/...
-- If a page only shows directory links, navigate into the company page to find the real URL.
-Collect at least 15 unique companies with real websites.
-STRICT RULES:
-1. Respond ONLY with a single valid JSON object — no extra text, no markdown, no explanation.
-2. Only use selectors/links that appear in the "elements" list provided. NEVER invent selectors.
-3. Get MORE results by scrolling, or navigating to the next page URL.
-4. Use "extract" to save visible results NOW. Use "done" only when you have 15+ real companies.
-5. IMPORTANT: Provide REAL company websites in extracted data, not directory/article links.
-   Good: {{"name": "Uniphore", "website": "https://www.uniphore.com"}}
-   Bad:  {{"name": "Uniphore", "website": "https://ai-startups.pro/video/uniphore/"}}
-6. If stuck, use "navigate" to a different source URL.
-7. NEVER navigate to google.com.
-
-RESPONSE FORMAT (always exactly this, nothing else):
-{{
-  "action": "click | type | navigate | scroll | extract | done",
-  "selector": "exact visible link text or CSS selector from the elements list",
-  "text": "text to type (only for type action)",
-  "url": "full URL starting with https:// (only for navigate action)",
-  "data": "JSON array of {{name, website}} objects (for extract/done actions)",
-  "reason": "one sentence"
-}}"""
-
-    messages = [{"role": "system", "content": system_prompt}]
-    history: list[dict] = []
-    seen_companies: dict[str, str] = {}   # name -> website, auto-deduplicates
+async def run():
+    seen: dict[str, dict] = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
         )
-        page = await context.new_page()
+        page = await ctx.new_page()
 
-        print(f"🔍 Searching DuckDuckGo: {SEARCH_QUERY}")
-        await page.goto(START_URL, wait_until="networkidle")
-        await asyncio.sleep(2)
-        print(f"🌐 Loaded: {page.url}\n")
+        # ── Phase 1: crawl ────────────────────────────────────────────────────
+        print("=" * 70)
+        print("Phase 1: Discovering Indian SME digital product sellers")
+        print("=" * 70)
 
-        for step in range(MAX_STEPS):
-            print(f"── Step {step + 1}/{MAX_STEPS} ──────────────────────────")
+        # Build seed list: Bing searches + direct marketplace pages
+        all_seeds = (
+            [BING_BASE.format(q=quote_plus(q)) for q in SEED_SEARCHES]
+            + SEED_URLS
+        )
 
-            # Loop detection
-            if detect_loop(history):
-                print("🔁 Loop detected — forcing navigation back to DuckDuckGo")
-                await page.goto(START_URL, wait_until="networkidle")
-                await asyncio.sleep(2)
-                history = history[:-MAX_RETRIES]
-                continue
-
-            page_summary = await get_page_summary(page)
-            current_url  = page.url
-
-            # Show LLM only the last 5 collected companies so context stays small
-            recent_found = list(seen_companies.items())[-5:]
-            recent_str   = "\n".join(f"  - {n}: {w}" for n, w in recent_found) or "None yet"
-
-            user_msg = f"""Current URL: {current_url}
-Companies found so far: {len(seen_companies)} (need 15+)
-Last 5 found:
-{recent_str}
-
-Page content & elements:
-{page_summary}
-
-Recent actions (last 5):
-{json.dumps(history[-5:], indent=2)}
-
-What is the next action?"""
-
-            messages_to_send = messages + [{"role": "user", "content": user_msg}]
-
-            try:
-                raw_response = await ask_llm(messages_to_send)
-            except Exception as e:
-                print(f"❌ LLM error: {e}")
+        for seed_idx, seed_url in enumerate(all_seeds):
+            if len(seen) >= TARGET:
                 break
 
-            print(f"🤖 LLM: {raw_response[:300]}")
-            action = parse_action(raw_response)
-            print(f"⚡ Action: {action['action']} | {action.get('reason', '')}")
-            history.append({k: action[k] for k in ["action", "selector", "url", "reason"]})
+            print(f"\n[Seed {seed_idx + 1}/{len(all_seeds)}] {seed_url[:80]}")
+            ok = await safe_goto(page, seed_url, timeout=30000, settle=3.0)
+            if not ok:
+                continue
 
-            # ── Execute ──────────────────────────────────────────────────────
-            try:
-                match action["action"]:
+            new = await discover_from_page(page, seen, page.url)
+            print(f"  Found {new} new sellers on this page (total: {len(seen)})")
 
-                    case "navigate":
-                        url = action["url"].strip()
-                        if not url.startswith("http"):
-                            url = "https://" + url
-                        if "google.com" in url:
-                            print("🚫 Blocked Google — redirecting to DuckDuckGo")
-                            url = START_URL
-                        await page.goto(url, wait_until="networkidle", timeout=30000)
-                        await asyncio.sleep(1.5)
+            # For Bing: follow top result links one level deep
+            if "bing.com" in seed_url:
+                links = await get_page_links(page)
+                result_links = [
+                    l["href"] for l in links
+                    if not is_junk_domain(l["href"])
+                    and "bing.com" not in l["href"]
+                ][:6]
 
-                    case "click":
-                        sel     = action["selector"]
-                        clicked = False
-                        for attempt in [
-                            lambda: page.click(sel, timeout=4000),
-                            lambda: page.get_by_text(sel, exact=False).first.click(timeout=4000),
-                        ]:
-                            try:
-                                await attempt()
-                                clicked = True
-                                break
-                            except Exception:
-                                pass
-                        if not clicked:
-                            print(f"⚠️  Could not click '{sel}' — scrolling instead")
-                            await page.mouse.wheel(0, 800)
-                        else:
-                            await page.wait_for_load_state("domcontentloaded")
-                        await asyncio.sleep(1.5)
+                for link in result_links:
+                    if len(seen) >= TARGET:
+                        break
+                    print(f"  -> {link[:70]}")
+                    ok2 = await safe_goto(page, link, timeout=20000, settle=2.0)
+                    if not ok2:
+                        continue
+                    added = await discover_from_page(page, seen, page.url)
+                    if added:
+                        print(f"     +{added} sellers (total: {len(seen)})")
 
-                    case "type":
-                        sel  = action["selector"]
-                        text = action["text"].rstrip("\n")
-                        typed = False
-                        for attempt in [
-                            lambda: page.fill(sel, text),
-                            lambda: page.get_by_placeholder(sel).fill(text),
-                        ]:
-                            try:
-                                await attempt()
-                                typed = True
-                                break
-                            except Exception:
-                                pass
-                        if not typed:
-                            print(f"⚠️  Could not type into '{sel}'")
-                        elif action["text"].endswith("\n"):
-                            await page.keyboard.press("Enter")
-                            await page.wait_for_load_state("domcontentloaded")
-                        await asyncio.sleep(1.5)
+        print(f"\nPhase 1 complete — {len(seen)} sellers discovered.")
 
-                    case "scroll":
-                        await page.mouse.wheel(0, 1200)
-                        await asyncio.sleep(2)
+        # ── Phase 2: scrape contacts ──────────────────────────────────────────
+        print("\n" + "=" * 70)
+        print("Phase 2: Scraping contacts (email / phone / WhatsApp / Instagram)")
+        print("=" * 70 + "\n")
 
-                    case "extract" | "done":
-                        raw_data = action.get("data", "")
-                        items    = parse_extracted_data(raw_data)
-                        new_count = 0
-                        for item in items:
-                            name    = item["name"].strip()
-                            website = item["website"].strip()
-                            if name and name not in seen_companies:
-                                seen_companies[name] = website
-                                new_count += 1
+        contact_page = await ctx.new_page()
+        for name, info in seen.items():
+            contacts = await scrape_contacts(contact_page, name, info["website"])
+            info.update(contacts)
+        await contact_page.close()
 
-                        if action["action"] == "extract":
-                            if new_count == 0:
-                                print("⚠️  No new companies — scrolling for more")
-                                await page.mouse.wheel(0, 1200)
-                                await asyncio.sleep(1.5)
-                            else:
-                                print(f"\n📋 +{new_count} new companies (total: {len(seen_companies)})\n")
+        # ── Results ───────────────────────────────────────────────────────────
+        total   = len(seen)
+        w_email = sum(1 for v in seen.values() if v["email"])
+        w_phone = sum(1 for v in seen.values() if v["phone"])
+        w_wa    = sum(1 for v in seen.values() if v["whatsapp"])
+        w_insta = sum(1 for v in seen.values() if v["instagram"])
 
-                        if action["action"] == "done":
-                            print_results(seen_companies, "✅ Task complete!")
-                            break
-
-            except Exception as e:
-                print(f"⚠️  Action failed: {e}")
-                if history:
-                    history[-1]["error"] = str(e)
-
-            await asyncio.sleep(1)
-
-        else:
-            print_results(seen_companies, "⏱️ Max steps reached —")
+        print(f"\n{'='*110}")
+        print(f"FINAL RESULTS — {total} Indian SME Digital Product Sellers")
+        print(f"{'='*110}")
+        header = (f"  {'#':<4} {'Business':<28} {'Category':<22} "
+                  f"{'Email':<28} {'Phone':<14} {'WhatsApp':<14} Instagram")
+        print(header)
+        print("  " + "-" * 106)
+        for i, (name, v) in enumerate(seen.items(), 1):
+            print(
+                f"  {i:<4} {name[:27]:<28} {v['category'][:21]:<22} "
+                f"{(v['email'] or '—')[:27]:<28} {(v['phone'] or '—'):<14} "
+                f"{(v['whatsapp'] or '—'):<14} {v['instagram'] or '—'}"
+            )
+        print(f"\n  Emails found    : {w_email}/{total}")
+        print(f"  Phones found    : {w_phone}/{total}")
+        print(f"  WhatsApp found  : {w_wa}/{total}")
+        print(f"  Instagram found : {w_insta}/{total}")
+        print(f"{'='*110}")
 
         await browser.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(run_agent())
+    asyncio.run(run())
